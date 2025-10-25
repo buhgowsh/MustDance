@@ -1,34 +1,42 @@
 import { useState } from 'react'
-import reactLogo from './assets/react.svg'
-import viteLogo from '/vite.svg'
+import AuthButtons from './components/AuthButtons.jsx'
+import Protected from './components/Protected.jsx'
+import Home from './screens/Home.jsx'
+import Play from './screens/Play.jsx'
+import Results from './screens/Results.jsx'
 import './App.css'
 
 function App() {
-  const [count, setCount] = useState(0)
+  const [screen, setScreen] = useState("HOME");
+  const [selection, SetSelection] = useState(null);
+  const [finalScore, setFinalScore] = useState(null);
 
   return (
-    <>
-      <div>
-        <a href="https://vite.dev" target="_blank">
-          <img src={viteLogo} className="logo" alt="Vite logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <h1>Vite + React</h1>
-      <div className="card">
-        <button onClick={() => setCount((count) => count + 1)}>
-          count is {count}
-        </button>
-        <p>
-          Edit <code>src/App.jsx</code> and save to test HMR
-        </p>
-      </div>
-      <p className="read-the-docs">
-        Click on the Vite and React logos to learn more
-      </p>
-    </>
+    <div className="min-h-screen bg-slate-950 text-slate-100">
+      <header className="flex justify-between items-center p-4 border-b border-slate-800">
+        <h1 className="font-bold">Must Dance</h1>
+        <AuthButtons />
+      </header>
+      {screen === "HOME" && (
+        <Protected>
+          <Home onStart={(danceConfig) => {SetSelection(danceConfig); setScreen("PLAY"); }}/>
+        </Protected>
+      )}
+      {screen === "PLAY" && (
+        <Protected>
+          <Play
+            selection={selection}
+            onFinish={(score) => {setFinalScore(score); setScreen("RESULTS");}}
+            onQuit={() => setScreen("HOME")}
+          />
+        </Protected>
+      )}
+      {screen === "RESULTS" && (
+        <Protected>
+          <Results score={finalScore} onHome={() => setScreen("HOME")} />
+        </Protected>
+      )}
+    </div>
   )
 }
 
