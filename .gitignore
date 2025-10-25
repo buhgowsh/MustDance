@@ -1,0 +1,3 @@
+# we want to ignore environmental variables and all node modules form inports
+node_modules/
+.env
