@@ -17,29 +17,40 @@ def process_reference_video(video_path, output_json="reference_dance.json"):
             if not ret:
                 break
 
-            # Process frame
+            # process frame
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             frame_rgb.flags.writeable = False
             results = holistic.process(frame_rgb)
 
-            # Extract angles if pose detected
+            # extract angles and landmarks if pose detected
             if results.pose_landmarks:
                 try:
                     angles = extract_joint_angles(results.pose_landmarks.landmark)
+
+                    # Store landmark coordinates for skeleton overlay
+                    landmarks = []
+                    for landmark in results.pose_landmarks.landmark:
+                        landmarks.append({
+                            "x": landmark.x,
+                            "y": landmark.y,
+                            "z": landmark.z,
+                            "visibility": landmark.visibility
+                        })
+
                     frames_data.append({
                         "frame_index": frame_index,
-                        "timestamp": cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0,  # seconds
-                        "angles": angles
+                        "timestamp": cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0,
+                        "angles": angles,
+                        "landmarks": landmarks  # Added for skeleton overlay
                     })
                 except Exception as e:
                     print(f"Error processing frame {frame_index}: {e}")
 
             frame_index += 1
 
+    fps = cap.get(cv2.CAP_PROP_FPS)
     cap.release()
 
-    # Save to JSON
-    fps = cap.get(cv2.CAP_PROP_FPS)
     with open(output_json, "w") as f:
         json.dump({
             "title": "Reference Dance",
@@ -49,8 +60,9 @@ def process_reference_video(video_path, output_json="reference_dance.json"):
         }, f, indent=2)
 
     print(f"Processed {len(frames_data)} frames from {video_path}")
+    print(f"Saved to {output_json}")
     return output_json
 
 
 if __name__ == "__main__":
-    process_reference_video("september.mp4")
+    process_reference_video("dance.mp4")
