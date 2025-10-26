@@ -4,7 +4,17 @@ import json
 import numpy as np
 from calculations import extract_joint_angles
 import time
+from fastapi.responses import StreamingResponse
+from fastapi import FastAPI
+app = FastAPI()
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 class Landmark:
     def __init__(self, x, y, z, visibility):
@@ -316,11 +326,26 @@ class DanceComparison:
                     self.playback_speed = max(0.1, self.playback_speed - 0.1)
                     print(f"Speed: {self.playback_speed:.1f}x")
 
-        webcam.release()
-        cv2.destroyAllWindows()
+        _, buffer = cv2.imencode('.jpg', frame)
+        frame = buffer.tobytes()
+
+        # yields the frame in a format suitable for streaming
+        yield b'--frame\r\n'b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n'
+
+
+def video_feed():
+    return StreamingResponse(DanceComparison.run_comparison, media_type='multipart/x-mixed-replace; boundary=frame')
+
+
+@app.get('/video_feed')
+def video_feed_endpoint():
+    return video_feed()
 
 
 if __name__ == "__main__":
-    # run processor first
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
     comparator = DanceComparison("reference_dance.json", playback_speed=0.5)
     comparator.run_comparison()
+
+
