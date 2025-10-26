@@ -116,16 +116,4 @@ video_pipeline_agent = SequentialAgent(
     description = "Executes a series of video searching, analyzing, and downloading.",
 )
 
-video_tool = AgentTool(agent=video_pipeline_agent)
-
-root_agent = Agent(
-    name = "root_agent",
-    model = "gemini-2.5-flash",
-    description = "Sends user given input to the sequential agent.",
-    instruction = """You are an exper caller.
-
-    ** Task **
-    Send the query from the user to the video_pipeline_agent tool.
-    """,
-    tools = [video_tool],
-)
+root_agent = video_pipeline_agent
