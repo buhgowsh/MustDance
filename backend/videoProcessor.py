@@ -65,4 +65,4 @@ def process_reference_video(video_path, output_json="reference_dance.json"):
 
 
 if __name__ == "__main__":
-    process_reference_video("dance.mp4")
+    process_reference_video("test.mp4")
