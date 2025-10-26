@@ -15,6 +15,9 @@ function RightColumnVisualizer({ src, playing }) {
   const unlockedRef = useRef(false);   // user-gesture unlock happened
   const initRef = useRef(false);       // prevent double init (StrictMode/dev)
   const rafRef = useRef(0);            // for cleanup
+  const playingRef = useRef(playing);  // track prop across handlers
+
+  useEffect(() => { playingRef.current = playing; }, [playing]);
 
   /* ---------- DRAW LOOP ---------- */
   useEffect(() => {
@@ -119,10 +122,9 @@ function RightColumnVisualizer({ src, playing }) {
     acRef.current = ac;
 
     const a = audioRef.current;
-    a.crossOrigin = "anonymous"; // safe if you ever host files elsewhere
+    a.crossOrigin = "anonymous";
 
     try {
-      // Only create one MediaElementSource per <audio> ever
       if (!sourceRef.current) {
         const node = ac.createMediaElementSource(a);
         const analyser = ac.createAnalyser();
@@ -138,20 +140,17 @@ function RightColumnVisualizer({ src, playing }) {
         analyserRef.current = analyser;
         dataRef.current = new Uint8Array(analyser.frequencyBinCount);
       }
-    } catch (e) {
-      // If hot-reload/StrictMode raced and created twice, we still continue.
-      // console.warn("MediaElementSource init issue:", e);
-    }
+    } catch {}
 
-    // Unlock: resume & unmute on first user gesture
+    // Unlock: resume & unmute on first user gesture; if user expected playing, start.
     const unlock = async () => {
       try {
         if (acRef.current?.state === "suspended") await acRef.current.resume();
         a.muted = false;
         unlockedRef.current = true;
-        // If the parent wants it playing, ensure play after unlock
-        // (ignore if parent passed playing=false)
-        // We don't know 'playing' here, but a click will also toggle in UI.
+        if (playingRef.current) {
+          try { await a.play(); } catch {}
+        }
       } catch {}
       window.removeEventListener("pointerdown", unlock);
     };
@@ -162,8 +161,9 @@ function RightColumnVisualizer({ src, playing }) {
       if (document.visibilityState === "visible") {
         try {
           if (acRef.current?.state === "suspended") await acRef.current.resume();
-          // If we were supposed to be playing, try to continue
-          if (!a.paused && unlockedRef.current) await a.play();
+          if (playingRef.current && unlockedRef.current) {
+            try { await a.play(); } catch {}
+          }
         } catch {}
       }
     };
@@ -183,7 +183,7 @@ function RightColumnVisualizer({ src, playing }) {
           analyserRef.current = null;
         }
         if (acRef.current) {
-          acRef.current.close(); // free audio hardware
+          acRef.current.close();
           acRef.current = null;
         }
       } catch {}
@@ -201,21 +201,15 @@ function RightColumnVisualizer({ src, playing }) {
       try {
         if (acRef.current?.state === "suspended") await acRef.current.resume();
 
-        // set new src only when it truly changed
         if (src && a.dataset.src !== src) {
           a.pause();
           a.currentTime = 0;
           a.dataset.src = src;
           a.src = src;
 
-          // Wait until it can play before playing
           await new Promise((res) => {
-            const onReady = () => {
-              a.removeEventListener("canplay", onReady);
-              res();
-            };
+            const onReady = () => { a.removeEventListener("canplay", onReady); res(); };
             a.addEventListener("canplay", onReady, { once: true });
-            // in case it's already ready (cache), resolve next tick
             if (a.readyState >= 2) {
               a.removeEventListener("canplay", onReady);
               res();
@@ -232,16 +226,11 @@ function RightColumnVisualizer({ src, playing }) {
         } else {
           a.pause();
         }
-      } catch (err) {
-        // Most failures are autoplay policy; will resolve after unlock.
-        // console.warn("audio play/pause error", err);
-      }
+      } catch {}
     };
 
     apply();
-    return () => {
-      cancel = true;
-    };
+    return () => { cancel = true; };
   }, [src, playing]);
 
   return (
@@ -254,21 +243,42 @@ function RightColumnVisualizer({ src, playing }) {
 
 /* -------------------- LEFT ANGLED MENU STRIP -------------------- */
 function DiagonalMenu({ children }) {
+  const { isAuthenticated, user } = useAuth0();
+
   return (
     <div className="relative h-full w-600px">
+      {/* angled gradient panel */}
       <div
         className="absolute -left-30 top-0 bottom-0 rounded-[18px] bg-gradient-to-b from-pink-500 via-rose-500 to-fuchsia-500 shadow-[0_0_100px_rgba(236,72,153,0.5)]"
         style={{ width: 600, transform: "skewX(-12deg)" }}
       />
+      {/* content */}
       <div className="absolute inset-0 top-20" style={{ transform: "skewX(-12deg)" }}>
         <div className="pl-25 pr-6 flex flex-col items-start gap-6 w-[340px]">
-          {/* --- Placeholder Logo --- */}
+          {/* Logo */}
           <div className="mb-4 w-full flex justify-center">
             <div className="w-40 h-40 bg-white/20 rounded-full flex items-center justify-center shadow-lg border border-white/30">
               <span className="text-3xl font-bold text-white tracking-wide">LOGO</span>
             </div>
           </div>
+
           {children}
+
+          {/* Profile block (bottom-left) */}
+          {isAuthenticated && (
+            <div className="mt-10 flex items-center gap-3 bg-white/12 border border-white/20 rounded-xl px-3 py-2 shadow backdrop-blur">
+              <img
+                src={user?.picture}
+                alt={user?.name || "Profile"}
+                className="w-9 h-9 rounded-full border border-white/30 object-cover"
+                referrerPolicy="no-referrer"
+              />
+              <div className="leading-tight">
+                <div className="text-sm font-semibold">{user?.name}</div>
+                <div className="text-xs text-white/70">{user?.email}</div>
+              </div>
+            </div>
+          )}
         </div>
       </div>
     </div>
@@ -345,6 +355,7 @@ export default function Home({ onStart }) {
         <div className="relative overflow-hidden">
           <RightColumnVisualizer src={currentTrack.path} playing={isPlaying} />
 
+          {/* now playing pill + controls */}
           <div className="absolute right-6 bottom-6 flex items-center gap-3 rounded-md bg-white/15 border border-white/20 px-3 py-2 text-sm backdrop-blur">
             <span className="opacity-80">now playing:</span>
             <span className="font-semibold">{currentTrack.name}</span>
