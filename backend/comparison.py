@@ -1,16 +1,26 @@
+# server/main.py
 import cv2
 import mediapipe as mp
 import json
 import numpy as np
-from calculations import extract_joint_angles
 import time
-from fastapi.responses import StreamingResponse
+from typing import Tuple
+
 from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+
+# ---------- OPTIONAL: your own angle extraction if needed ----------
+# from calculations import extract_joint_angles
+
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=[
+        "http://localhost:5173",  # Vite default
+        "http://localhost:3000",  # CRA
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -26,326 +36,247 @@ class Landmark:
 
 class DanceComparison:
     def __init__(self, reference_json_path, playback_speed=0.5):
-        with open(reference_json_path, 'r') as f:
+        with open(reference_json_path, "r") as f:
             self.reference_data = json.load(f)
 
-        self.reference_frames = self.reference_data['frames']
-        self.reference_fps = self.reference_data.get('fps', 30)
-        self.playback_speed = playback_speed  # 0.5 = half speed, 1.0 = normal, 2.0 = double
+        self.reference_frames = self.reference_data["frames"]
+        self.reference_fps = self.reference_data.get("fps", 30)
+        self.playback_speed = playback_speed
 
         self.mp_holistic = mp.solutions.holistic
-        self.mp_drawing = mp.solutions.drawing_utils
         self.mp_pose = mp.solutions.pose
 
         self.start_time = None
         self.current_ref_index = 0
         self.paused = False
 
-    def calculate_similarity_score(self, live_angles, ref_angles):
-        if not live_angles or not ref_angles:
-            return 0.0
-
-        total_score = 0
-        count = 0
-
-        # weight for different joints (more important joints have higher weight)
-        joint_weights = {
-            'leftElbow': 1.0,
-            'rightElbow': 1.0,
-            'leftShoulder': 1.5,
-            'rightShoulder': 1.5,
-            'leftHip': 2.0,  # Core movements are most important
-            'rightHip': 2.0,
-            'leftKnee': 1.5,
-            'rightKnee': 1.5,
-            'torsoTilt': 2.5,  # Body position is critical
-            'shoulderTilt': 1.5
-        }
-
-        for joint in live_angles.keys():
-            if joint in ref_angles:
-                diff = abs(live_angles[joint] - ref_angles[joint])
-
-                # More aggressive scoring - penalize differences more
-                # Perfect match (0 deg) = 100%, 15 deg = 75%, 30 deg = 50%, 45 deg = 25%, 60+ deg = 0%
-                if diff <= 15:
-                    score = 100 - (diff / 15 * 25)  # 100 to 75
-                elif diff <= 30:
-                    score = 75 - ((diff - 15) / 15 * 25)  # 75 to 50
-                elif diff <= 45:
-                    score = 50 - ((diff - 30) / 15 * 25)  # 50 to 25
-                elif diff <= 60:
-                    score = 25 - ((diff - 45) / 15 * 25)  # 25 to 0
-                else:
-                    score = 0
-
-                weight = joint_weights.get(joint, 1.0)
-                total_score += score * weight
-                count += weight
-
-        if count == 0:
-            return 0.0
-
-        similarity = total_score / count
-        return max(0.0, min(100.0, similarity))
-
-    def get_joint_scores(self, live_angles, ref_angles):
-        """Get individual joint accuracy scores"""
-        scores = {}
-        for joint in live_angles.keys():
-            if joint in ref_angles:
-                diff = abs(live_angles[joint] - ref_angles[joint])
-
-                # Same aggressive scoring as overall
-                if diff <= 15:
-                    score = 100 - (diff / 15 * 25)
-                elif diff <= 30:
-                    score = 75 - ((diff - 15) / 15 * 25)
-                elif diff <= 45:
-                    score = 50 - ((diff - 30) / 15 * 25)
-                elif diff <= 60:
-                    score = 25 - ((diff - 45) / 15 * 25)
-                else:
-                    score = 0
-
-                scores[joint] = max(0, score)
-        return scores
-
-    def draw_skeleton(self, frame, landmarks, color, thickness=2, alpha=1.0):
-        if landmarks is None:
-            return
-
-        connections = self.mp_pose.POSE_CONNECTIONS
-        h, w, _ = frame.shape
-
-        if alpha < 1.0:
-            overlay = frame.copy()
-        else:
-            overlay = frame
-
-        # draw connections
-        for connection in connections:
-            start_idx = connection[0]
-            end_idx = connection[1]
-
-            start = landmarks[start_idx]
-            end = landmarks[end_idx]
-
-            if hasattr(start, 'visibility') and hasattr(end, 'visibility'):
-                if start.visibility < 0.5 or end.visibility < 0.5:
-                    continue
-
-            start_point = (int(start.x * w), int(start.y * h))
-            end_point = (int(end.x * w), int(end.y * h))
-
-            cv2.line(overlay, start_point, end_point, color, thickness)
-
-        # draw landmarks
-        for landmark in landmarks:
-            if hasattr(landmark, 'visibility') and landmark.visibility < 0.5:
+    # ---------------- helpers: normalization & drawing ----------------
+    @staticmethod
+    def mp_to_np_xy(landmarks, W, H, min_vis=0.3):
+        pts = np.full((33, 2), np.nan, dtype=np.float32)  # 33 pose landmarks
+        for i, lm in enumerate(landmarks):
+            if hasattr(lm, "visibility") and lm.visibility < min_vis:
                 continue
-            point = (int(landmark.x * w), int(landmark.y * h))
-            cv2.circle(overlay, point, 4, color, -1)
+            pts[i, 0] = lm.x * W
+            pts[i, 1] = lm.y * H
+        return pts
 
-        # apply transparency
+    @staticmethod
+    def json_to_np_xy(lm_list, W=1.0, H=1.0, min_vis=0.0):
+        pts = np.full((33, 2), np.nan, dtype=np.float32)
+        for i, lm in enumerate(lm_list[:33]):
+            vis = lm.get("visibility", 1.0)
+            if vis < min_vis:
+                continue
+            pts[i, 0] = float(lm["x"]) * W
+            pts[i, 1] = float(lm["y"]) * H
+        return pts
+
+    @staticmethod
+    def center_and_scale(pts: np.ndarray) -> Tuple[np.ndarray, float, np.ndarray]:
+        """Center on torso centroid and scale by shoulder-hip distance."""
+        P = mp.solutions.pose.PoseLandmark
+        idxs = [P.LEFT_SHOULDER.value, P.RIGHT_SHOULDER.value,
+                P.LEFT_HIP.value, P.RIGHT_HIP.value]
+        torso = pts[idxs]
+        torso = torso[np.isfinite(torso).all(axis=1)]
+        if len(torso) < 2:
+            c = np.nanmean(pts, axis=0)
+            s = 1.0
+            return pts - c, s, c
+        c = torso.mean(axis=0)
+        d = 0.0
+        # average of pair distances (shoulders & hips)
+        if np.isfinite(pts[P.LEFT_SHOULDER.value]).all() and np.isfinite(pts[P.RIGHT_SHOULDER.value]).all():
+            d += np.linalg.norm(pts[P.LEFT_SHOULDER.value] - pts[P.RIGHT_SHOULDER.value])
+        if np.isfinite(pts[P.LEFT_HIP.value]).all() and np.isfinite(pts[P.RIGHT_HIP.value]).all():
+            d += np.linalg.norm(pts[P.LEFT_HIP.value] - pts[P.RIGHT_HIP.value])
+        d = d / 2.0 if d > 0 else 200.0
+        s = d if d > 1e-5 else 200.0
+        return (pts - c) / s, s, c
+
+    @staticmethod
+    def procrustes_2d(A: np.ndarray, B: np.ndarray):
+        """
+        Find similarity transform mapping A -> B (scale s, rotation R, translation t)
+        using Procrustes on finite rows.
+        """
+        maskA = np.isfinite(A).all(axis=1)
+        maskB = np.isfinite(B).all(axis=1)
+        mask = maskA & maskB
+        A2 = A[mask]
+        B2 = B[mask]
+        if len(A2) < 2:
+            # identity fallback
+            return 1.0, np.eye(2, dtype=np.float32), np.zeros(2, dtype=np.float32)
+
+        # center
+        muA = A2.mean(axis=0)
+        muB = B2.mean(axis=0)
+        A0 = A2 - muA
+        B0 = B2 - muB
+
+        # scale
+        normA = np.sqrt((A0**2).sum())
+        normB = np.sqrt((B0**2).sum())
+        if normA < 1e-8 or normB < 1e-8:
+            return 1.0, np.eye(2, dtype=np.float32), muB - muA
+
+        A0 /= normA
+        B0 /= normB
+
+        # rotation
+        H = A0.T @ B0
+        U, _, VT = np.linalg.svd(H)
+        R = U @ VT
+        if np.linalg.det(R) < 0:
+            U[:, -1] *= -1
+            R = U @ VT
+
+        s = (normB / normA)
+        t = muB - (s * (R @ muA))
+        return float(s), R.astype(np.float32), t.astype(np.float32)
+
+    @staticmethod
+    def apply_transform(pts: np.ndarray, s, R, t):
+        out = np.full_like(pts, np.nan)
+        mask = np.isfinite(pts).all(axis=1)
+        out[mask] = (s * (pts[mask] @ R.T)) + t
+        return out
+
+    @staticmethod
+    def draw_skeleton_np(frame, pts, color=(0, 255, 0), thickness=3, alpha=1.0):
+        P = mp.solutions.pose.PoseLandmark
+        connections = list(mp.solutions.pose.POSE_CONNECTIONS)
+        h, w, _ = frame.shape
+        overlay = frame.copy() if alpha < 1.0 else frame
+
+        def ok(i):
+            return i is not None and 0 <= i < len(pts) and np.isfinite(pts[i]).all()
+
+        # lines
+        for a, b in connections:
+            if ok(a) and ok(b):
+                pa = (int(pts[a, 0]), int(pts[a, 1]))
+                pb = (int(pts[b, 0]), int(pts[b, 1]))
+                cv2.line(overlay, pa, pb, color, thickness, lineType=cv2.LINE_AA)
+        # joints
+        for i in range(min(len(pts), 33)):
+            if ok(i):
+                p = (int(pts[i, 0]), int(pts[i, 1]))
+                cv2.circle(overlay, p, 4, color, -1, lineType=cv2.LINE_AA)
+
         if alpha < 1.0:
             cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
 
-    def draw_info_panel(self, frame, similarity_score, joint_scores, frame_number):
-        # Draw information panel with scores
-        h, w, _ = frame.shape
-        panel_height = 250
-        panel = np.zeros((panel_height, w, 3), dtype=np.uint8)
-
-        cv2.putText(panel, f"Accuracy: {similarity_score:.1f}% | Speed: {self.playback_speed:.1f}x",
-                    (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-
-        # frame info
-        total_frames = len(self.reference_frames)
-        progress_pct = (frame_number / total_frames) * 100 if total_frames > 0 else 0
-        cv2.putText(panel, f"Progress: {frame_number}/{total_frames} ({progress_pct:.0f}%)",
-                    (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-
-        # Color code for accuracy - MORE STRICT THRESHOLDS
-        if similarity_score >= 90:
-            color = (0, 255, 0)  # green, excellent
-            status = "Excellent!"
-        elif similarity_score >= 75:
-            color = (0, 255, 255)  # yellow, good
-            status = "Good"
-        elif similarity_score >= 60:
-            color = (0, 165, 255)  # orange, fair
-            status = "Fair"
-        elif similarity_score >= 40:
-            color = (0, 100, 255)  # dark orange, Poor
-            status = "Needs Work"
-        else:
-            color = (0, 0, 255)  # red, very Poor
-            status = "Try Again"
-
-        cv2.putText(panel, status, (w - 200, 35),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-
-        # progress bar
-        bar_width = int((similarity_score / 100) * (w - 40))
-        cv2.rectangle(panel, (10, 90), (10 + bar_width, 115), color, -1)
-        cv2.rectangle(panel, (10, 90), (w - 30, 115), (100, 100, 100), 2)
-
-        cv2.putText(panel, "Live: GREEN | Reference: RED",
-                    (10, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-
-        # individual joint scores
-        if joint_scores:
-            y_offset = 170
-            sorted_joints = sorted(joint_scores.items(), key=lambda x: x[1])[:5]
-
-            cv2.putText(panel, "Areas to improve:",
-                        (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 100), 1)
-
-            for i, (joint, score) in enumerate(sorted_joints):
-                y_pos = y_offset + 25 + (i * 15)
-                joint_color = (0, 255, 0) if score >= 80 else (0, 255, 255) if score >= 60 else (0, 0, 255)
-                joint_name = joint.replace('left', 'L.').replace('right', 'R.')
-                cv2.putText(panel, f"{joint_name}: {score:.0f}%",
-                            (20, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.45, joint_color, 1)
-
-        # Controls
-        cv2.putText(panel, "Controls: Q=Quit | R=Restart | SPACE=Pause | +/- Speed",
-                    (w - 450, panel_height - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
-
-        return panel
-
-    def run_comparison(self):
-        # run real-time comparison with skeleton overlay
+    # ------------------ streams ------------------
+    def stream_live(self):
+        """Camera + magenta reference ghost (aligned) + green live skeleton."""
         webcam = cv2.VideoCapture(0)
-
         with self.mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5) as holistic:
-
             self.start_time = time.time()
             pause_time = 0
-
             while webcam.isOpened():
-                ret, frame = webcam.read()
-                if not ret:
+                ok, frame = webcam.read()
+                if not ok:
                     break
-
-                # flip frame horizontally for mirror effect
                 frame = cv2.flip(frame, 1)
+                h, w, _ = frame.shape
 
-                # calculate which reference frame to use
                 if not self.paused:
-                    elapsed_time = time.time() - self.start_time - pause_time
-                    # apply playback speed
-                    adjusted_time = elapsed_time * self.playback_speed
-                    self.current_ref_index = int(adjusted_time * self.reference_fps) % len(self.reference_frames)
+                    elapsed = time.time() - self.start_time - pause_time
+                    adjusted = elapsed * self.playback_speed
+                    self.current_ref_index = int(adjusted * self.reference_fps) % len(self.reference_frames)
 
-                # process live frame
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frame_rgb.flags.writeable = False
-                results = holistic.process(frame_rgb)
-                frame_rgb.flags.writeable = True
-                frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                rgb.flags.writeable = False
+                results = holistic.process(rgb)
+                rgb.flags.writeable = True
+                frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
-                similarity_score = 0
-                joint_scores = {}
-
-                # get reference frame data
+                # reference (normalized 0..1 → px)
                 ref_frame = self.reference_frames[self.current_ref_index]
+                ref_norm = None
+                if "landmarks" in ref_frame:
+                    ref_norm = self.json_to_np_xy(ref_frame["landmarks"], 1.0, 1.0, min_vis=0.3)
 
-                # draw reference skeleton (RED, semi-transparent)
-                if 'landmarks' in ref_frame:
-                    ref_landmarks = [
-                        Landmark(lm['x'], lm['y'], lm['z'], lm['visibility'])
-                        for lm in ref_frame['landmarks']
-                    ]
-                    self.draw_skeleton(frame, ref_landmarks, (0, 0, 255), thickness=2, alpha=0.5)
-
-                # process and draw live skeleton (GREEN)
                 if results.pose_landmarks:
-                    try:
-                        # check if pose is valid (facing camera)
-                        landmarks = results.pose_landmarks.landmark
-                        mp_pose_landmarks = mp.solutions.pose.PoseLandmark
+                    live_px = self.mp_to_np_xy(results.pose_landmarks.landmark, w, h, min_vis=0.3)
 
-                        # check visibility of key landmarks
-                        left_shoulder_vis = landmarks[mp_pose_landmarks.LEFT_SHOULDER].visibility
-                        right_shoulder_vis = landmarks[mp_pose_landmarks.RIGHT_SHOULDER].visibility
-                        left_hip_vis = landmarks[mp_pose_landmarks.LEFT_HIP].visibility
-                        right_hip_vis = landmarks[mp_pose_landmarks.RIGHT_HIP].visibility
+                    # normalize both (center+scale) then align reference to live using Procrustes
+                    if ref_norm is not None:
+                        # map ref to px (0..1 to px first so we use same space)
+                        ref_px = ref_norm * np.array([[w, h]], dtype=np.float32)
 
-                        # if too many key points are not visible, person is likely sideways/turned away
-                        key_visibility = [left_shoulder_vis, right_shoulder_vis, left_hip_vis, right_hip_vis]
-                        avg_visibility = sum(key_visibility) / len(key_visibility)
+                        s, R, t = self.procrustes_2d(ref_px, live_px)
+                        ref_aligned = self.apply_transform(ref_px, s, R, t)
+                        # draw ghost (magenta) over live
+                        self.draw_skeleton_np(frame, ref_aligned, (200, 120, 255), thickness=3, alpha=0.45)
 
-                        if avg_visibility < 0.5:
-                            # person is not facing camera properly
-                            cv2.putText(frame, "FACE THE CAMERA!", (50, 100),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
-                            similarity_score = 0
-                        else:
-                            live_angles = extract_joint_angles(results.pose_landmarks.landmark)
-                            ref_angles = ref_frame['angles']
+                    # draw user (green)
+                    self.draw_skeleton_np(frame, live_px, (80, 255, 120), thickness=3, alpha=1.0)
 
-                            similarity_score = self.calculate_similarity_score(live_angles, ref_angles)
-                            joint_scores = self.get_joint_scores(live_angles, ref_angles)
+                ok, buf = cv2.imencode(".jpg", frame)
+                if not ok:
+                    continue
+                yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n")
 
-                            # Draw live skeleton on top
-                            self.draw_skeleton(frame, results.pose_landmarks.landmark,
-                                               (0, 255, 0), thickness=3)
+        webcam.release()
 
-                    except Exception as e:
-                        print(f"Error: {e}")
+    def stream_ref(self, width=280, height=460):
+        """Skinny standalone reference avatar panel (for UI side card)."""
+        webcam = cv2.VideoCapture(0)  # pace timer
+        with self.mp_holistic.Holistic() as _:
+            self.start_time = time.time()
+            while True:
+                _ = webcam.read()
+                panel = np.zeros((height, width, 3), dtype=np.uint8)
+                panel[:] = (26, 22, 46)  # deep slate bg
 
-                info_panel = self.draw_info_panel(frame, similarity_score, joint_scores,
-                                                  self.current_ref_index)
+                # border glow
+                cv2.rectangle(panel, (8, 8), (width - 8, height - 8), (180, 100, 220), 2)
 
-                combined = np.vstack([frame, info_panel])
+                elapsed = time.time() - self.start_time
+                adjusted = elapsed * self.playback_speed
+                idx = int(adjusted * self.reference_fps) % len(self.reference_frames)
+                ref_frame = self.reference_frames[idx]
 
-                cv2.imshow("Dance Comparison: Overlay Mode", combined)
+                if "landmarks" in ref_frame:
+                    ref_norm = np.clip(
+                        np.array([[lm["x"], lm["y"]] for lm in ref_frame["landmarks"]], dtype=np.float32),
+                        0.0, 1.0
+                    )
+                    # center & scale into panel
+                    cx, cy = width // 2, height // 2
+                    scale = int(min(width, height) * 0.38)
+                    pts = (ref_norm - 0.5) * scale
+                    pts[:, 0] += cx
+                    pts[:, 1] += cy
 
-                # controls
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
-                    break
-                elif key == ord('r'):
-                    self.start_time = time.time()
-                    self.current_ref_index = 0
-                    pause_time = 0
-                    self.paused = False
-                elif key == ord(' '):
-                    self.paused = not self.paused
-                    if self.paused:
-                        pause_start = time.time()
-                    else:
-                        pause_time += time.time() - pause_start
-                elif key == ord('+') or key == ord('='):  # Speed up
-                    self.playback_speed = min(2.0, self.playback_speed + 0.1)
-                    print(f"Speed: {self.playback_speed:.1f}x")
-                elif key == ord('-') or key == ord('_'):  # Slow down
-                    self.playback_speed = max(0.1, self.playback_speed - 0.1)
-                    print(f"Speed: {self.playback_speed:.1f}x")
+                    self.draw_skeleton_np(panel, pts, (200, 120, 255), thickness=3, alpha=1.0)
 
-        _, buffer = cv2.imencode('.jpg', frame)
-        frame = buffer.tobytes()
+                cv2.putText(panel, "COACH", (14, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (230, 220, 255), 2)
 
-        # yields the frame in a format suitable for streaming
-        yield b'--frame\r\n'b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n'
+                ok, buf = cv2.imencode(".jpg", panel)
+                if not ok:
+                    continue
+                yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n")
+        webcam.release()
 
 
-def video_feed():
-    return StreamingResponse(DanceComparison.run_comparison, media_type='multipart/x-mixed-replace; boundary=frame')
+# Reusable instance
+comparator = DanceComparison("reference_dance.json", playback_speed=0.5)
 
+@app.get("/video_live")
+def video_live():
+    return StreamingResponse(
+        comparator.stream_live(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
 
-@app.get('/video_feed')
-def video_feed_endpoint():
-    return video_feed()
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
-    comparator = DanceComparison("reference_dance.json", playback_speed=0.5)
-    comparator.run_comparison()
-
-
+@app.get("/video_ref")
+def video_ref():
+    return StreamingResponse(
+        comparator.stream_ref(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )

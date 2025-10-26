@@ -1,275 +1,209 @@
 // src/screens/Play.jsx
 import { useEffect, useRef, useState } from "react";
-import { usePose } from "../pose/usePose";
-import { scoreAngles } from "../pose/poseUtils";
-import SongCard from "../components/SongCard";
-
-// MediaPipe subset connections
-const EDGES = [
-  [11,12], [11,23], [12,24], [23,24],
-  [11,13], [13,15],
-  [12,14], [14,16],
-  [23,25], [25,27],
-  [24,26], [26,28],
-];
-
-// ---------- helpers to render the target "ghost" aligned to the user ----------
-const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
-const angleToBend = (deg) => (typeof deg !== "number" ? 0 : clamp((180 - deg) / 90, 0, 1));
-
-function drawGhost(ctx, anchor, scale, angles) {
-  // Base model geometry
-  const hipGap = 38 * scale;
-  const shoulderGapModel = 76;               // model shoulder gap (unscaled)
-  const shoulderGap = shoulderGapModel * scale;
-
-  const upperLeg = 70 * scale;
-  const lowerLeg = 70 * scale;
-  const upperArm = 60 * scale;
-  const lowerArm = 60 * scale;
-
-  const kL = angleToBend(angles?.leftKnee);
-  const kR = angleToBend(angles?.rightKnee);
-  const eL = angleToBend(angles?.leftElbow);
-  const eR = angleToBend(angles?.rightElbow);
-
-  // Place hips at anchor
-  const hipL = { x: anchor.x - hipGap / 2, y: anchor.y };
-  const hipR = { x: anchor.x + hipGap / 2, y: anchor.y };
-  const shoulderY = anchor.y - 1.2 * upperLeg; // rough torso height
-  const headY = shoulderY - 0.6 * upperLeg;
-
-  const shL = { x: anchor.x - shoulderGap / 2, y: shoulderY };
-  const shR = { x: anchor.x + shoulderGap / 2, y: shoulderY };
-  const head = { x: anchor.x, y: headY };
-
-  ctx.lineCap = "round";
-  ctx.lineJoin = "round";
-  ctx.strokeStyle = "rgba(56,189,248,0.75)"; // cyan
-  ctx.lineWidth = 4;
-  ctx.shadowColor = "rgba(56,189,248,0.45)";
-  ctx.shadowBlur = 10;
-
-  // Torso
-  ctx.beginPath();
-  ctx.moveTo(head.x, head.y);
-  ctx.lineTo(anchor.x, shoulderY - 6);
-  ctx.lineTo(anchor.x, anchor.y);
-  ctx.stroke();
-
-  // Shoulders / hips
-  ctx.beginPath();
-  ctx.moveTo(shL.x, shL.y); ctx.lineTo(shR.x, shR.y);
-  ctx.moveTo(hipL.x, hipL.y); ctx.lineTo(hipR.x, hipR.y);
-  ctx.stroke();
-
-  // Arms
-  const elL = { x: shL.x - upperArm, y: shL.y };
-  const wristL = {
-    x: elL.x - lowerArm * (1 - 0.15 * eL),
-    y: elL.y + lowerArm * (0.55 + 0.45 * eL),
-  };
-  ctx.beginPath(); ctx.moveTo(shL.x, shL.y); ctx.lineTo(elL.x, elL.y); ctx.lineTo(wristL.x, wristL.y); ctx.stroke();
-
-  const elR = { x: shR.x + upperArm, y: shR.y };
-  const wristR = {
-    x: elR.x + lowerArm * (1 - 0.15 * eR),
-    y: elR.y + lowerArm * (0.55 + 0.45 * eR),
-  };
-  ctx.beginPath(); ctx.moveTo(shR.x, shR.y); ctx.lineTo(elR.x, elR.y); ctx.lineTo(wristR.x, wristR.y); ctx.stroke();
-
-  // Legs
-  const kneeForward = 34 * scale;
-  const kneeL = { x: hipL.x + kneeForward * kL, y: hipL.y + upperLeg * (0.7 + 0.3 * (1 - kL)) };
-  const ankleL = { x: kneeL.x, y: kneeL.y + lowerLeg };
-  ctx.beginPath(); ctx.moveTo(hipL.x, hipL.y); ctx.lineTo(kneeL.x, kneeL.y); ctx.lineTo(ankleL.x, ankleL.y); ctx.stroke();
-
-  const kneeR = { x: hipR.x + kneeForward * kR, y: hipR.y + upperLeg * (0.7 + 0.3 * (1 - kR)) };
-  const ankleR = { x: kneeR.x, y: kneeR.y + lowerLeg };
-  ctx.beginPath(); ctx.moveTo(hipR.x, hipR.y); ctx.lineTo(kneeR.x, kneeR.y); ctx.lineTo(ankleR.x, ankleR.y); ctx.stroke();
-}
+import MjpegViewer from "../components/MjpegViewer";
 
 export default function Play({ selection, onFinish, onQuit }) {
-  const camRef = useRef(null);
-  const canvasRef = useRef(null);
+  const [counting, setCounting] = useState(false);
+  const [count, setCount] = useState(3);
   const [running, setRunning] = useState(false);
-  const [stepIdx, setStepIdx] = useState(0);
-  const [stepTime, setStepTime] = useState(0);
-  const [scoreTrail, setScoreTrail] = useState([]);
-  const [ready, setReady] = useState(false);
-  const [err, setErr] = useState("");
 
-  // Webcam
+  // live metrics from SSE
+  const [accuracy, setAccuracy] = useState(0);
+  const [score, setScore] = useState(0);
+
+  // client averages + series for Results
+  const [accSum, setAccSum] = useState(0);
+  const [accFrames, setAccFrames] = useState(0);
+  const accSeriesRef = useRef([]);
+
+  const esRef = useRef(null);
+  const [mounted, setMounted] = useState(false);
+
   useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const s = await navigator.mediaDevices.getUserMedia({
-          video: { width: { ideal: 1280 }, height: { ideal: 720 } },
-          audio: false
-        });
-        if (cancelled) return;
-        const v = camRef.current;
-        v.srcObject = s;
-        v.addEventListener("loadedmetadata", () => {
-          v.play().catch(()=>{});
-          setReady(true);
-        }, { once: true });
-      } catch (e) {
-        console.error(e);
-        setErr(e?.message || String(e));
-      }
-    })();
-    return () => { cancelled = true; };
+    const t = setTimeout(() => setMounted(true), 30);
+    return () => clearTimeout(t);
   }, []);
 
-  // Live pose
-  const { landmarks, angles } = usePose(camRef);
-
-  // Timer
+  // 3-sec countdown → start server play + metrics
   useEffect(() => {
-    if (!running) return;
-    const id = setInterval(() => setStepTime((t)=>t+0.1), 100);
-    return () => clearInterval(id);
-  }, [running]);
+    if (!counting) return;
+    setCount(3);
 
-  // Advance steps / finish
-  useEffect(() => {
-    const step = selection.steps[stepIdx];
-    if (!step) return;
-    if (stepTime >= step.duration) {
-      setStepTime(0);
-      if (stepIdx + 1 < selection.steps.length) setStepIdx(stepIdx+1);
-      else {
-        setRunning(false);
-        const avg = Math.round(scoreTrail.reduce((a,b)=>a+b,0)/Math.max(1,scoreTrail.length));
-        onFinish(avg);
-      }
-    }
-  }, [stepTime, stepIdx, selection, scoreTrail, onFinish]);
+    const id = setInterval(() => {
+      setCount((c) => {
+        if (c <= 1) {
+          clearInterval(id);
+          setCounting(false);
 
-  // Draw webcam + user skeleton + TARGET ghost aligned to user
-  useEffect(() => {
-    if (!ready) return;
-    const v = camRef.current;
-    const canvas = canvasRef.current;
-    const ctx = canvas.getContext("2d");
-    let raf;
+          // kick off the backend playback AFTER the countdown
+          fetch("http://localhost:8000/control?play=1").catch(() => {});
+          setRunning(true);
 
-    const draw = () => {
-      if (v.readyState >= 2 && v.videoWidth && v.videoHeight) {
-        canvas.width = v.videoWidth;
-        canvas.height = v.videoHeight;
-
-        ctx.drawImage(v, 0, 0, canvas.width, canvas.height);
-
-        const currentStep = selection.steps[stepIdx];
-        let stepScore = 0;
-        if (angles && currentStep?.targetAngles) {
-          stepScore = scoreAngles(angles, currentStep.targetAngles);
-          setScoreTrail((arr)=> (arr.length>200?arr.slice(1):arr).concat(stepScore));
-        }
-
-        // HUD
-        ctx.fillStyle = "rgba(0,0,0,0.45)";
-        ctx.fillRect(0,0,canvas.width,60);
-        ctx.fillStyle = "#fff";
-        ctx.font = "18px system-ui, sans-serif";
-        ctx.fillText(`Step: ${currentStep?.label ?? "-"}`, 16, 24);
-        ctx.fillText(`Score: ${stepScore}`, 16, 48);
-
-        // Progress
-        const prog = Math.min(1, stepTime/(currentStep?.duration??1));
-        ctx.fillStyle = "#10b981";
-        ctx.fillRect(0, canvas.height-6, prog*canvas.width, 6);
-
-        // --- draw live skeleton (as before)
-        if (landmarks?.length) {
-          ctx.lineWidth = 3;
-          ctx.strokeStyle = "#38bdf8";
-          ctx.fillStyle = "#f59e0b";
-          ctx.beginPath();
-          for (const [a,b] of EDGES) {
-            const pa = landmarks[a], pb = landmarks[b];
-            if (!pa || !pb) continue;
-            ctx.moveTo(pa.x * canvas.width,  pa.y * canvas.height);
-            ctx.lineTo(pb.x * canvas.width,  pb.y * canvas.height);
-          }
-          ctx.stroke();
-
-          const JOINTS = [11,12,13,14,15,16,23,24,25,26,27,28];
-          for (const i of JOINTS) {
-            const p = landmarks[i];
-            if (!p) continue;
-            ctx.beginPath();
-            ctx.arc(p.x * canvas.width, p.y * canvas.height, 5, 0, Math.PI*2);
-            ctx.fill();
-          }
-
-          // --- TARGET GHOST: follow user's body (anchor + scale per frame)
-          const LSH = landmarks[11], RSH = landmarks[12];
-          const LHIP = landmarks[23], RHIP = landmarks[24];
-          if (LSH && RSH && LHIP && RHIP && currentStep?.targetAngles) {
-            const shoulderGapPx =
-              Math.hypot((RSH.x-LSH.x)*canvas.width, (RSH.y-LSH.y)*canvas.height);
-            const anchor = {
-              x: ((LHIP.x + RHIP.x) / 2) * canvas.width,
-              y: ((LHIP.y + RHIP.y) / 2) * canvas.height,
+          // start metrics stream (SSE)
+          if (!esRef.current) {
+            const es = new EventSource("http://localhost:8000/metrics");
+            es.onmessage = (e) => {
+              try {
+                const d = JSON.parse(e.data || "{}");
+                const a = Number.isFinite(d.accuracy) ? d.accuracy : 0;
+                const s = Number.isFinite(d.score) ? d.score : 0;
+                setAccuracy(a);
+                setScore(s);
+                setAccSum((p) => p + a);
+                setAccFrames((p) => p + 1);
+                accSeriesRef.current.push({ t: Date.now(), a });
+                if (accSeriesRef.current.length > 7200) accSeriesRef.current.shift(); // ~2min @60fps
+              } catch {}
             };
-            // Model shoulder gap was ~76; derive scale from the user's actual width
-            const scale = clamp(shoulderGapPx / 76, 0.5, 2.2);
-            drawGhost(ctx, anchor, scale, currentStep.targetAngles);
+            es.onerror = () => {
+              es.close();
+              esRef.current = null;
+            };
+            esRef.current = es;
           }
+          return 0;
         }
-      }
-      raf = requestAnimationFrame(draw);
-    };
+        return c - 1;
+      });
+    }, 1000);
 
-    raf = requestAnimationFrame(draw);
-    return () => cancelAnimationFrame(raf);
-  }, [ready, landmarks, angles, stepIdx, stepTime, selection]);
+    return () => clearInterval(id);
+  }, [counting]);
+
+  // cleanup on unmount
+  useEffect(() => {
+    return () => {
+      try { fetch("http://localhost:8000/control?play=0"); } catch {}
+      if (esRef.current) { esRef.current.close(); esRef.current = null; }
+    };
+  }, []);
+
+  const handleStart = () => {
+    // reset both client & server
+    fetch("http://localhost:8000/control?play=0").finally(() => {
+      setAccuracy(0); setScore(0);
+      setAccSum(0); setAccFrames(0);
+      accSeriesRef.current = [];
+      setCounting(true);
+    });
+  };
+
+  const handleQuit = () => {
+    fetch("http://localhost:8000/control?play=0").catch(() => {});
+    if (esRef.current) { esRef.current.close(); esRef.current = null; }
+    const avgAccuracy = accFrames > 0 ? accSum / accFrames : 0;
+    setRunning(false);
+    onFinish?.({
+      score: Math.round(score),
+      accuracy: Math.round(avgAccuracy),
+      accuracySeries: accSeriesRef.current.slice(),
+    });
+  };
 
   return (
     <main className="relative min-h-screen bg-slate-950 text-white overflow-hidden">
-      {/* Target-pose card (shows current step’s pose) */}
-      <div className="absolute left-6 top-6 z-30">
-        <SongCard
-          title={selection?.title ?? "Selected Song"}
-          bpm={selection?.bpm ?? 100}
-          currentAngles={selection?.steps?.[stepIdx]?.targetAngles}
-        />
+      {/* ambient vibe */}
+      <div
+        className="pointer-events-none absolute inset-0 -z-10 transition-opacity duration-500"
+        style={{
+          background:
+            "radial-gradient(1300px 800px at 0% 100%, rgba(56,189,248,0.25), transparent 60%)," +
+            "radial-gradient(1200px 700px at 50% -10%, rgba(236,72,153,0.22), transparent 60%)",
+          opacity: mounted ? 1 : 0,
+        }}
+      />
+
+      {/* top bar */}
+      <div className="sticky top-0 z-10 backdrop-blur border-b border-white/10 bg-white/5">
+        <div className="mx-auto max-w-7xl px-6 py-4 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="h-8 w-8 rounded-lg bg-gradient-to-br from-pink-500 to-sky-400 shadow" />
+            <div className="leading-tight">
+              <div className="text-xs uppercase tracking-widest text-white/70">Play</div>
+              <div className="font-semibold">
+                {selection?.title || "Dance"}{" "}
+                <span className="text-white/70">•</span>{" "}
+                <span className="text-white/80">BPM {selection?.bpm ?? "-"}</span>
+              </div>
+            </div>
+          </div>
+
+          {/* live stat pills */}
+          <div className="flex items-center gap-3">
+            <div className="px-3 py-1 rounded-md border border-white/15 bg-white/10 text-sm transition-all duration-200">
+              Acc: <span className="font-semibold">{accuracy.toFixed(1)}%</span>
+            </div>
+            <div className="px-3 py-1 rounded-md border border-white/15 bg-white/10 text-sm">
+              Score: <span className="font-semibold">{score.toFixed(1)}</span>
+            </div>
+            <button
+              onClick={() => { handleQuit(); onQuit?.(); }}
+              className="px-3 py-1.5 rounded-md border border-white/20 hover:bg-white/10 transition"
+            >
+              ← Home
+            </button>
+          </div>
+        </div>
       </div>
 
-      {/* Camera centered */}
-      <div className="max-w-[1100px] mx-auto pt-28 pb-24">
-        <div className="relative">
-          <video ref={camRef} className="hidden" playsInline autoPlay muted />
-          <canvas
-            ref={canvasRef}
-            className="w-full rounded-2xl border border-slate-800 shadow-[0_20px_60px_rgba(0,0,0,0.5)]"
+      {/* body */}
+      <section className="mx-auto max-w-7xl px-6 py-8 grid grid-cols-[360px_1fr] gap-8 items-start">
+        {/* Coach (smaller; subtle slide in) */}
+        <div
+          className={`rounded-2xl border border-white/10 bg-white/5 overflow-hidden shadow-[0_0_60px_rgba(236,72,153,0.18)] transform transition duration-500
+          ${mounted ? "opacity-100 translate-x-0" : "opacity-0 -translate-x-4"}`}
+        >
+          <div className="px-4 py-3 text-xs tracking-wider uppercase text-white/70">Coach</div>
+          <MjpegViewer
+            src="http://localhost:8000/video_ref"
+            className="w-full h-[460px] object-cover bg-black"
+            alt="reference"
           />
+          <div className="px-4 py-3 text-xs text-white/70 border-t border-white/10">
+            {selection?.title || "Dance"} • BPM {selection?.bpm ?? "-"}
+          </div>
         </div>
 
-        <div className="mt-6 flex gap-3">
-          {!running ? (
-            <button
-              className="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-700 transition"
-              onClick={()=>{ setRunning(true); setStepIdx(0); setStepTime(0); setScoreTrail([]); }}
-            >
-              Start
-            </button>
-          ) : (
-            <button
-              className="px-4 py-2 rounded-lg bg-rose-600 hover:bg-rose-700 transition"
-              onClick={()=>{ setRunning(false); onQuit(); }}
-            >
-              Quit
-            </button>
+        {/* Live camera (same height as coach) */}
+        <div
+          className={`relative rounded-2xl border border-white/10 bg-white/5 overflow-hidden shadow-[0_0_60px_rgba(34,211,238,0.18)] flex items-center justify-center transform transition duration-500
+          ${mounted ? "opacity-100 translate-x-0" : "opacity-0 translate-x-4"}`}
+        >
+          <MjpegViewer
+            src="http://localhost:8000/video_live"
+            className="h-[460px] w-full max-w-[1200px] object-contain bg-black"
+            alt="live"
+          />
+
+          {/* countdown overlay */}
+          {counting && (
+            <div className="absolute inset-0 grid place-items-center bg-black/40 backdrop-blur-sm">
+              <div className="text-8xl font-extrabold tracking-widest animate-pulse scale-110">
+                {count || "GO!"}
+              </div>
+            </div>
           )}
-        </div>
 
-        {err && <div className="mt-3 text-rose-400">Camera error: {err}</div>}
-      </div>
+          {/* CTA */}
+          <div className="absolute right-5 bottom-5 flex items-center gap-3">
+            {!running ? (
+              <button
+                className="px-5 py-2 rounded-xl border border-emerald-300/30 bg-emerald-400/10 hover:bg-emerald-400/20 shadow transition"
+                onClick={handleStart}
+              >
+                Start
+              </button>
+            ) : (
+              <button
+                className="px-5 py-2 rounded-xl border border-rose-300/30 bg-rose-400/10 hover:bg-rose-400/20 shadow transition"
+                onClick={handleQuit}
+              >
+                Quit
+              </button>
+            )}
+          </div>
+        </div>
+      </section>
     </main>
   );
 }

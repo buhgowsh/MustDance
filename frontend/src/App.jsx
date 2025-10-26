@@ -1,5 +1,4 @@
 import { useState } from "react";
-import { useAuth0 } from "@auth0/auth0-react";
 import AuthButtons from "./components/AuthButtons.jsx";
 import Protected from "./components/Protected.jsx";
 import Home from "./screens/Home.jsx";
@@ -11,12 +10,10 @@ function App() {
   const [screen, setScreen] = useState("HOME");
   const [selection, setSelection] = useState(null);
   const [finalScore, setFinalScore] = useState(null);
-  const { isAuthenticated } = useAuth0();
+  const [finalAccuracy, setFinalAccuracy] = useState(null);
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100">
-      {/* Show login header ONLY when logged out */}
-      {!isAuthenticated && <AuthButtons />}
 
       {screen === "HOME" && (
         <Protected>
@@ -33,8 +30,9 @@ function App() {
         <Protected>
           <Play
             selection={selection}
-            onFinish={(score) => {
+            onFinish={({ score, accuracy }) => {
               setFinalScore(score);
+              setFinalAccuracy(accuracy);
               setScreen("RESULTS");
             }}
             onQuit={() => setScreen("HOME")}
@@ -44,7 +42,11 @@ function App() {
 
       {screen === "RESULTS" && (
         <Protected>
-          <Results score={finalScore} onHome={() => setScreen("HOME")} />
+          <Results
+            score={finalScore}
+            accuracy={finalAccuracy}
+            onHome={() => setScreen("HOME")}
+          />
         </Protected>
       )}
     </div>
