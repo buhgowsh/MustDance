@@ -121,7 +121,7 @@ video_tool = AgentTool(agent=video_pipeline_agent)
 root_agent = Agent(
     name = "root_agent",
     model = "gemini-2.5-flash",
-    description = "Sends user given input to the sequential agent."
+    description = "Sends user given input to the sequential agent.",
     instruction = """You are an exper caller.
 
     ** Task **
