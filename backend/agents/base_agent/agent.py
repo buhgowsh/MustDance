@@ -1,6 +1,7 @@
 import os
 from google.adk.agents import Agent
 from google.adk.agents import SequentialAgent
+from google.adk.tools.agent_tool import AgentTool
 from dotenv import load_dotenv
 import yt_dlp
 from yt_dlp.utils import download_range_func
@@ -115,4 +116,16 @@ video_pipeline_agent = SequentialAgent(
     description = "Executes a series of video searching, analyzing, and downloading.",
 )
 
-root_agent = video_pipeline_agent
+video_tool = AgentTool(agent=video_pipeline_agent)
+
+root_agent = Agent(
+    name = "root_agent",
+    model = "gemini-2.5-flash",
+    description = "Sends user given input to the sequential agent."
+    instruction = """You are an exper caller.
+
+    ** Task **
+    Send the query from the user to the video_pipeline_agent tool.
+    """,
+    tools = [video_tool],
+)
