@@ -84,6 +84,7 @@ def video_download(url: str, start: int, end: int):
         'verbose': True,
         'force_keyframes_at_cuts': True,
         'outtmpl': "test",
+        'merge_output_format': "mp4",
         'download_ranges': download_range_func(None, [(start, end)]),
     }
 
