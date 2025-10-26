@@ -1,6 +1,7 @@
 // src/screens/Home.jsx
 import { useEffect, useRef, useState } from "react";
 import { getDanceConfig } from "../services/danceService";
+import { searchAdkSong } from "../services/adkService";
 import { useAuth0 } from "@auth0/auth0-react";
 
 /* -------------------- RIGHT COLUMN: FULL-HEIGHT VISUALIZER -------------------- */
@@ -120,14 +121,12 @@ function RightColumnVisualizer({ src, playing, onEnded }) {
     const a = audioRef.current;
     if (!a) return;
 
-    // Create AudioContext lazily so StrictMode fake-mount cleanup doesn't kill it.
     if (!acRef.current) {
       const AC = window.AudioContext || window.webkitAudioContext;
       acRef.current = new AC();
     }
     const ac = acRef.current;
 
-    // Build graph once
     if (!sourceRef.current || !analyserRef.current || !dataRef.current) {
       const node = ac.createMediaElementSource(a);
       const analyser = ac.createAnalyser();
@@ -144,16 +143,13 @@ function RightColumnVisualizer({ src, playing, onEnded }) {
       dataRef.current = new Uint8Array(analyser.frequencyBinCount);
     }
 
-    // Set basic attrs once
     a.crossOrigin = "anonymous";
     a.playsInline = true;
     a.preload = "auto";
 
-    // Wire handlers once
     if (!initOnceRef.current) {
       initOnceRef.current = true;
 
-      // Unlock on first user gesture
       const unlock = async () => {
         try {
           if (acRef.current?.state === "suspended") await acRef.current.resume();
@@ -167,7 +163,6 @@ function RightColumnVisualizer({ src, playing, onEnded }) {
       };
       window.addEventListener("pointerdown", unlock, { once: true });
 
-      // Tab visibility
       const onVis = async () => {
         if (!acRef.current) return;
         try {
@@ -177,19 +172,16 @@ function RightColumnVisualizer({ src, playing, onEnded }) {
               try { await a.play(); } catch {}
             }
           } else {
-            // Suspend to play nice with browsers and battery
             await acRef.current.suspend();
           }
         } catch {}
       };
       document.addEventListener("visibilitychange", onVis);
 
-      // auto-advance if desired
       if (onEnded) {
         a.addEventListener("ended", onEnded);
       }
 
-      // cleanup (do NOT close the AudioContext—just unhook listeners)
       return () => {
         window.removeEventListener("pointerdown", unlock);
         document.removeEventListener("visibilitychange", onVis);
@@ -207,12 +199,10 @@ function RightColumnVisualizer({ src, playing, onEnded }) {
 
       await ensureAudioGraph();
 
-      // resume the context if autopause happened
       try {
         if (acRef.current?.state === "suspended") await acRef.current.resume();
       } catch {}
 
-      // set new src only when it truly changed
       if (src && a.dataset.src !== src) {
         a.pause();
         a.currentTime = 0;
@@ -232,7 +222,6 @@ function RightColumnVisualizer({ src, playing, onEnded }) {
       if (cancelled) return;
 
       if (playing) {
-        // Autoplay policy: keep muted until unlocked
         if (!unlockedRef.current) a.muted = true;
         try { await a.play(); } catch {}
       } else {
@@ -246,14 +235,129 @@ function RightColumnVisualizer({ src, playing, onEnded }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [src, playing]);
 
-  // DO NOT tear down the audio context graph on unmount in dev (StrictMode double-mount).
-  // If you really need to free resources on a real page change, you can listen to
-  // a route-unload signal and close there.
-
   return (
     <div className="relative h-full w-full">
       <canvas ref={canvasRef} className="absolute inset-0 w-full h-full block" />
       <audio ref={audioRef} />
+    </div>
+  );
+}
+
+/* -------------------- FULLSCREEN SONG PICKER -------------------- */
+function SongPickerOverlay({ open, onClose, onStartTutorial, onStartAdk }) {
+  const [query, setQuery] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState("");
+
+  useEffect(() => {
+    if (!open) return;
+    setErr("");
+    setLoading(false);
+    const onKey = (e) => { if (e.key === "Escape") onClose?.(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
+
+  if (!open) return null;
+
+  const handleTutorial = async () => {
+    setErr("");
+    setLoading(true);
+    try {
+      await onStartTutorial();
+    } catch (e) {
+      setErr(e?.message || "Failed to start tutorial.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleAdk = async (e) => {
+    e.preventDefault();
+    if (!query.trim()) {
+      setErr("Type a song / artist to search.");
+      return;
+    }
+    setErr("");
+    setLoading(true);
+    try {
+      await onStartAdk(query.trim());
+    } catch (e) {
+      setErr(e?.message || "ADK search failed.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50">
+      {/* Backdrop */}
+      <div className="absolute inset-0 bg-slate-950/80 backdrop-blur-sm animate-fadeIn" />
+      {/* Panel */}
+      <div className="absolute inset-0 grid place-items-center p-6">
+        <div className="w-full max-w-3xl rounded-2xl border border-white/10 bg-gradient-to-b from-slate-900/90 to-slate-950/90 shadow-[0_10px_60px_rgba(236,72,153,0.25)] animate-slideUp">
+          <div className="flex items-center justify-between px-6 py-4 border-b border-white/10">
+            <h2 className="text-lg font-semibold tracking-wide">Choose Your Song</h2>
+            <button
+              onClick={onClose}
+              className="rounded-md border border-white/15 px-3 py-1.5 hover:bg-white/10"
+            >
+              Back
+            </button>
+          </div>
+
+          <div className="grid md:grid-cols-2 gap-6 p-6">
+            {/* Tutorial card */}
+            <div className="rounded-xl border border-emerald-300/20 bg-white/5 p-5">
+              <h3 className="font-semibold text-emerald-300 mb-2">Tutorial Song</h3>
+              <p className="text-sm text-white/80 mb-4">
+                Start with the built-in test track and the salsa basic routine.
+              </p>
+              <button
+                disabled={loading}
+                onClick={handleTutorial}
+                className="w-full rounded-md px-4 py-2 border border-emerald-300/30 hover:bg-emerald-400/10 active:scale-[0.98] transition"
+              >
+                {loading ? "Starting…" : "Play Tutorial"}
+              </button>
+            </div>
+
+            {/* Google ADK card */}
+            <div className="rounded-xl border border-cyan-300/20 bg-white/5 p-5">
+              <h3 className="font-semibold text-cyan-300 mb-2">Search via Google ADK</h3>
+              <p className="text-sm text-white/80 mb-3">
+                Type a song/artist, we’ll fetch audio + BPM and build a routine.
+              </p>
+
+              <form onSubmit={handleAdk} className="space-y-3">
+                <input
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  placeholder="e.g., Dua Lipa – Houdini"
+                  className="w-full rounded-md bg-slate-900/70 border border-white/15 px-3 py-2 outline-none focus:border-cyan-300/40"
+                />
+                <button
+                  type="submit"
+                  disabled={loading}
+                  className="w-full rounded-md px-4 py-2 border border-cyan-300/30 hover:bg-cyan-400/10 active:scale-[0.98] transition"
+                >
+                  {loading ? "Searching…" : "Search & Play"}
+                </button>
+              </form>
+
+              {err && <div className="mt-3 text-xs text-rose-400">{err}</div>}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Animations */}
+      <style>{`
+        .animate-fadeIn { animation: fadeIn .18s ease-out both; }
+        .animate-slideUp { animation: slideUp .24s ease-out both; }
+        @keyframes fadeIn { from { opacity: 0 } to { opacity: 1 } }
+        @keyframes slideUp { from { transform: translateY(10px); opacity: 0 } to { transform: translateY(0); opacity: 1 } }
+      `}</style>
     </div>
   );
 }
@@ -334,6 +438,8 @@ export default function Home({ onStart }) {
   const [isPlaying, setIsPlaying] = useState(true);
   const currentTrack = playlist[trackIdx];
 
+  const [pickerOpen, setPickerOpen] = useState(false);
+
   const prevTrack = () => {
     setTrackIdx((i) => (i - 1 + playlist.length) % playlist.length);
     setIsPlaying(true);
@@ -344,13 +450,24 @@ export default function Home({ onStart }) {
   };
   const togglePlay = () => setIsPlaying((p) => !p);
 
-  const handleStart = async () =>
-    onStart(await getDanceConfig(query.trim().toLowerCase()));
+  const handleOpenPicker = () => setPickerOpen(true);
+  const handleClosePicker = () => setPickerOpen(false);
+
+  const handleStartTutorial = async () => {
+    const cfg = await getDanceConfig("salsa-basic");
+    setPickerOpen(false);
+    onStart(cfg);
+  };
+
+  const handleStartAdk = async (q) => {
+    const cfg = await searchAdkSong(q);
+    setPickerOpen(false);
+    onStart(cfg);
+  };
 
   const handleLogout = () =>
     logout({ logoutParams: { returnTo: window.location.origin } });
 
-  // auto-advance handler for the audio element
   const handleEnded = () => nextTrack();
 
   return (
@@ -368,7 +485,7 @@ export default function Home({ onStart }) {
         {/* LEFT */}
         <div className="relative">
           <DiagonalMenu>
-            <MenuButton active onClick={handleStart}>New Song</MenuButton>
+            <MenuButton active onClick={handleOpenPicker}>New Song</MenuButton>
             <MenuButton>Options</MenuButton>
             <MenuButton onClick={handleLogout}>Log out</MenuButton>
           </DiagonalMenu>
@@ -419,6 +536,14 @@ export default function Home({ onStart }) {
       <div className="absolute left-6 bottom-4 text-xs text-white/70">
         knighthacks VII 2025
       </div>
+
+      {/* Fullscreen song picker */}
+      <SongPickerOverlay
+        open={pickerOpen}
+        onClose={handleClosePicker}
+        onStartTutorial={handleStartTutorial}
+        onStartAdk={handleStartAdk}
+      />
     </main>
   );
 }
