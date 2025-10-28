@@ -1,7 +1,10 @@
-# we want to ignore environmental variables and all node modules form inports
+# environment variables, IDE files, and module/cache folders
 node_modules/
 .env
 .vscode/
 .python-version
 __pycache__/
+
+# video files
 *.webm
+*.mp4
